@@ -569,12 +569,15 @@ namespace nvhttp {
       response->close_connection_after_response = true;
     });
 
-    // LumeN US-005 Step 2 / 2b: resolve the peer's Tailscale identity and
-    // consult the LumeN policy. We DO NOT short-circuit the PIN flow on
-    // admit (that requires Moonlight-side cooperation and lands in Step 3);
-    // we DO refuse pair() outright when the policy denies. That alone
-    // closes the public-attacker path: only tailnet peers whose policy
-    // says "admit" can even start the PIN exchange.
+    // LumeN US-005 Step 2 / 2b / 3b: resolve the peer's Tailscale identity
+    // and consult the LumeN policy.
+    //   - Deny (no identity or policy rejects) → 403 immediately.
+    //   - Admit → set lumen_auto_pair so the getservercert phase below uses
+    //     a deterministic shared PIN ("0000") instead of waiting for a UI
+    //     insert. The actual security boundary is the Tailscale identity
+    //     gate; the PIN was always a poor cousin of mutual trust and adds
+    //     no value once we already know the peer's tailnet identity.
+    bool lumen_auto_pair = false;
     try {
       auto peer_addr = request->remote_endpoint().address().to_string();
       auto identity = lumen::lookup_identity(peer_addr);
@@ -606,6 +609,7 @@ namespace nvhttp {
         tree.put("root.paired", 0);
         return;
       }
+      lumen_auto_pair = true;
     } catch (const std::exception &e) {
       BOOST_LOG(warning)
         << "lumen: pair() admission check threw: " << e.what()
@@ -638,6 +642,16 @@ namespace nvhttp {
         auto ptr = map_id_sess.emplace(sess.client.uniqueID, std::move(sess)).first;
 
         ptr->second.async_insert_pin.salt = std::move(get_arg(args, "salt"));
+        if (lumen_auto_pair) {
+          // LumeN US-005 Step 3b: peer was admitted by the Tailscale policy
+          // gate above, so we already trust their identity. Skip the PIN UI
+          // (web dashboard / CLI prompt / tray pop-up) and run the standard
+          // PIN crypto with the LumeN convention value "0000". The client
+          // side knows to use the same constant.
+          BOOST_LOG(info) << "lumen: pair() auto-pairing with shared PIN";
+          getservercert(ptr->second, tree, "0000");
+          return;
+        }
         if (config::sunshine.flags[config::flag::PIN_STDIN]) {
           std::string pin;
 
