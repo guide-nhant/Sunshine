@@ -20,6 +20,8 @@
 #include "globals.h"
 #include "httpcommon.h"
 #include "logging.h"
+#include "lumen_policy.h"
+#include "lumen_tailscale_identity.h"
 #include "main.h"
 #include "nvhttp.h"
 #include "process.h"
@@ -179,6 +181,32 @@ int main(int argc, char *argv[]) {
 
   // Log publisher metadata
   log_publisher_data();
+
+  // LumeN: log our own Tailscale identity at startup, plus the active
+  // policy summary, so operators can see at a glance what this host is
+  // and which peers it admits. Failures here are non-fatal.
+  if (auto self = lumen::lookup_self()) {
+    BOOST_LOG(info)
+      << "lumen: this host is tailnet user=" << self->user
+      << " host=" << self->hostname
+      << " node=" << self->node_key
+      << " ip=" << self->tailscale_ip
+      << " tags=" << self->tags.size();
+  } else {
+    BOOST_LOG(info)
+      << "lumen: tailscale daemon unreachable at startup — peer admission "
+         "will deny all until the daemon comes up";
+  }
+  {
+    auto policy_path = lumen::default_policy_path();
+    auto policy = lumen::load_policy(policy_path);
+    BOOST_LOG(info)
+      << "lumen: policy file = " << policy_path
+      << " (tags=" << policy.allow_tags.size()
+      << " node_keys=" << policy.allow_node_keys.size()
+      << " users=" << policy.allow_users.size()
+      << " default=" << (policy.default_admit ? "admit" : "deny") << ")";
+  }
 
   // Log modified_config_settings
   config::log_config_settings(config::modified_config_settings, false);

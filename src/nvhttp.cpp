@@ -26,6 +26,8 @@
 #include "globals.h"
 #include "httpcommon.h"
 #include "logging.h"
+#include "lumen_policy.h"
+#include "lumen_tailscale_identity.h"
 #include "network.h"
 #include "nvhttp.h"
 #include "platform/common.h"
@@ -566,6 +568,53 @@ namespace nvhttp {
       response->write(data.str());
       response->close_connection_after_response = true;
     });
+
+    // LumeN US-005 Step 2 / 2b: resolve the peer's Tailscale identity and
+    // consult the LumeN policy. We DO NOT short-circuit the PIN flow on
+    // admit (that requires Moonlight-side cooperation and lands in Step 3);
+    // we DO refuse pair() outright when the policy denies. That alone
+    // closes the public-attacker path: only tailnet peers whose policy
+    // says "admit" can even start the PIN exchange.
+    try {
+      auto peer_addr = request->remote_endpoint().address().to_string();
+      auto identity = lumen::lookup_identity(peer_addr);
+      auto policy = lumen::load_policy(lumen::default_policy_path());
+      lumen::decision_t decision;
+      if (identity) {
+        decision = lumen::admit(policy, *identity);
+        BOOST_LOG(info)
+          << "lumen: pair() peer=" << peer_addr
+          << " user=" << identity->user
+          << " host=" << identity->hostname
+          << " node=" << identity->node_key
+          << " tags=" << identity->tags.size()
+          << " decision=" << (decision.admit ? "admit" : "deny")
+          << " rule=" << decision.rule
+          << " reason=" << decision.reason;
+      } else {
+        decision.admit = false;
+        decision.rule = "no-identity";
+        decision.reason = "peer is not in the local tailnet or daemon unreachable";
+        BOOST_LOG(info)
+          << "lumen: pair() peer=" << peer_addr
+          << " — no tailscale identity; denying";
+      }
+      if (!decision.admit) {
+        tree.put("root.<xmlattr>.status_code", 403);
+        tree.put("root.<xmlattr>.status_message",
+                 "LumeN policy denied this peer: " + decision.reason);
+        tree.put("root.paired", 0);
+        return;
+      }
+    } catch (const std::exception &e) {
+      BOOST_LOG(warning)
+        << "lumen: pair() admission check threw: " << e.what()
+        << " — denying";
+      tree.put("root.<xmlattr>.status_code", 500);
+      tree.put("root.<xmlattr>.status_message", "LumeN admission check failed");
+      tree.put("root.paired", 0);
+      return;
+    }
 
     auto args = request->parse_query_string();
     if (args.find("uniqueid"s) == std::end(args)) {
