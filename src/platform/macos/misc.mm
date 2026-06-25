@@ -75,10 +75,29 @@ namespace platf {
         // Double check that these weakly-linked symbols have been loaded:
         CGPreflightScreenCaptureAccess != nullptr && CGRequestScreenCaptureAccess != nullptr &&
         !CGPreflightScreenCaptureAccess()) {
-      BOOST_LOG(error) << "No screen capture permission!"sv;
-      BOOST_LOG(error) << "Please activate it in 'System Preferences' -> 'Privacy' -> 'Screen Recording'"sv;
+      BOOST_LOG(info) << "Screen capture not yet granted — requesting and waiting up to 60s."sv;
       CGRequestScreenCaptureAccess();
-      return nullptr;
+      // LumeN spawns this helper as a subprocess on launch; if the user
+      // hasn't granted Screen Recording yet, exiting immediately would
+      // dismiss the macOS prompt before they can react. Poll preflight so
+      // the helper survives the grant and proceeds without a restart.
+      // ADR 0009: prompt attributes to LumeN because the helper is signed
+      // under the LumeN identity.
+      constexpr int max_wait_seconds = 60;
+      bool granted = false;
+      for (int i = 0; i < max_wait_seconds * 2; ++i) {
+        [NSThread sleepForTimeInterval:0.5];
+        if (CGPreflightScreenCaptureAccess()) {
+          granted = true;
+          break;
+        }
+      }
+      if (!granted) {
+        BOOST_LOG(error) << "No screen capture permission!"sv;
+        BOOST_LOG(error) << "Please grant LumeN in 'System Settings' -> 'Privacy & Security' -> 'Screen Recording'"sv;
+        return nullptr;
+      }
+      BOOST_LOG(info) << "Screen capture permission granted, continuing."sv;
     }
 #pragma clang diagnostic pop
     // Record that we determined that we have the screen capture permission.
