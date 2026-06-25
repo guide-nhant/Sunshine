@@ -67,10 +67,15 @@ namespace lumen {
 
   static std::optional<std::string> run_cli(const std::string &exec) {
     // We avoid std::system / boost::process to keep dependencies tight.
-    std::string cmd = "\"" + exec + "\" status --json 2>/dev/null";
+    // The stderr sink differs per platform: cmd.exe has no /dev/null, and
+    // redirecting to it fails the whole command ("The system cannot find
+    // the path specified"), which leaves the host with no tailnet identity
+    // and denies every pairing on Windows. Use NUL there.
 #ifdef _WIN32
+    std::string cmd = "\"" + exec + "\" status --json 2>NUL";
     FILE *pipe = _popen(cmd.c_str(), "r");
 #else
+    std::string cmd = "\"" + exec + "\" status --json 2>/dev/null";
     FILE *pipe = popen(cmd.c_str(), "r");
 #endif
     if (!pipe) return std::nullopt;
