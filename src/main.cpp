@@ -10,6 +10,7 @@
 #include <iostream>
 
 #ifdef __APPLE__
+  #include <ApplicationServices/ApplicationServices.h>
   #include <mach-o/dyld.h>
 #endif
 
@@ -126,6 +127,20 @@ void mainThreadLoop(const std::shared_ptr<safe::event_t<bool>> &shutdown_event) 
 
 int main(int argc, char *argv[]) {
 #ifdef __APPLE__
+  // Detach from the Dock immediately — lumen-host is a background
+  // helper inside LumeN.app, not a user-facing app, and ADR 0009
+  // ships it as a flat binary with no Info.plist of its own, so
+  // LSUIElement / LSBackgroundOnly can't be declared the usual way.
+  // TransformProcessType is the canonical runtime equivalent: it
+  // demotes the current process to a UIElement (no Dock tile, no
+  // app menu), and we do it before anything touches NSApp so the
+  // Dock never gets a chance to flash a second LumeN icon next to
+  // the parent.
+  {
+    ProcessSerialNumber psn = {0, kCurrentProcess};
+    TransformProcessType(&psn, kProcessTransformToUIElementApplication);
+  }
+
   // Bundle assets are referenced relative to the executable
   // (e.g. ../Resources/assets), so anchor cwd to Contents/MacOS.
   {
