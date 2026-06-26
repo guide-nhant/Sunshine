@@ -167,8 +167,6 @@ namespace lumen {
       }
     }
     CloseHandle(h);
-    BOOST_LOG_TRIVIAL(info)
-      << "lumen_tailscale: LocalAPI read " << resp.size() << " bytes";
 
     auto hdr_end = resp.find("\r\n\r\n");
     if (hdr_end == std::string::npos) return std::nullopt;
