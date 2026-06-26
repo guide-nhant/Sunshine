@@ -8,10 +8,16 @@
 
 #include "lumen_tailscale_identity.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <filesystem>
 #include <sstream>
+
+#ifdef _WIN32
+  #define WIN32_LEAN_AND_MEAN
+  #include <windows.h>
+#endif
 
 #include <boost/log/trivial.hpp>
 #include <boost/property_tree/json_parser.hpp>
@@ -63,21 +69,129 @@ namespace lumen {
 #endif
   }
 
-  // ─── popen helper ──────────────────────────────────────────────────────────
+  // ─── Status fetch ────────────────────────────────────────────────────────
+  //
+  // The status JSON is identical to `tailscale status --json`. How we get
+  // it differs by platform:
+  //   - Windows: read it straight from the Tailscale LocalAPI over its
+  //     named pipe. We must NOT shell out to the CLI here: when LumeN is
+  //     installed as an MSIX package the host runs inside the app container,
+  //     where spawning a child process (cmd.exe → tailscale.exe) hangs and
+  //     the pairing admit gate blocks forever. A named pipe has no such
+  //     restriction.
+  //   - macOS/Linux: shell out to the CLI (the LocalAPI sits behind a Unix
+  //     socket that's more work to speak, and there's no container issue).
 
-  static std::optional<std::string> run_cli(const std::string &exec) {
-    // We avoid std::system / boost::process to keep dependencies tight.
-    // The stderr sink differs per platform: cmd.exe has no /dev/null, and
-    // redirecting to it fails the whole command ("The system cannot find
-    // the path specified"), which leaves the host with no tailnet identity
-    // and denies every pairing on Windows. Use NUL there.
 #ifdef _WIN32
-    std::string cmd = "\"" + exec + "\" status --json 2>NUL";
-    FILE *pipe = _popen(cmd.c_str(), "r");
+  // De-chunk an HTTP/1.1 `Transfer-Encoding: chunked` body.
+  static std::string dechunk(const std::string &body) {
+    std::string out;
+    size_t pos = 0;
+    while (pos < body.size()) {
+      size_t eol = body.find("\r\n", pos);
+      if (eol == std::string::npos) break;
+      std::string size_hex = body.substr(pos, eol - pos);
+      if (auto sc = size_hex.find(';'); sc != std::string::npos) {
+        size_hex.resize(sc);  // drop chunk extensions
+      }
+      size_t chunk = 0;
+      try {
+        chunk = std::stoul(size_hex, nullptr, 16);
+      } catch (...) {
+        break;
+      }
+      if (chunk == 0) break;  // last chunk
+      size_t data = eol + 2;
+      if (data + chunk > body.size()) break;
+      out.append(body, data, chunk);
+      pos = data + chunk + 2;  // skip data + trailing CRLF
+    }
+    return out;
+  }
+
+  static std::optional<std::string> run_cli(const std::string & /*exec*/) {
+    constexpr const wchar_t *kPipe =
+      L"\\\\.\\pipe\\ProtectedPrefix\\Administrators\\Tailscale\\tailscaled";
+    HANDLE h = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+      // SECURITY_IMPERSONATION lets tailscaled impersonate us to authorize
+      // the LocalAPI call — without it the API replies 401.
+      h = CreateFileW(kPipe, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                      OPEN_EXISTING,
+                      SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION, nullptr);
+      if (h != INVALID_HANDLE_VALUE) break;
+      if (GetLastError() != ERROR_PIPE_BUSY || !WaitNamedPipeW(kPipe, 2000)) {
+        BOOST_LOG_TRIVIAL(warning)
+          << "lumen_tailscale: cannot open Tailscale LocalAPI pipe (err="
+          << GetLastError() << ")";
+        return std::nullopt;
+      }
+    }
+    if (h == INVALID_HANDLE_VALUE) return std::nullopt;
+
+    static const std::string req =
+      "GET /localapi/v0/status HTTP/1.1\r\n"
+      "Host: local-tailscaled.sock\r\n"
+      "Sec-Tailscale: localapi\r\n"
+      "Connection: close\r\n\r\n";
+    DWORD written = 0;
+    if (!WriteFile(h, req.data(), static_cast<DWORD>(req.size()), &written,
+                   nullptr)) {
+      CloseHandle(h);
+      return std::nullopt;
+    }
+    // Drain with PeekNamedPipe + a hard deadline so a slow/silent tailscaled
+    // can never block the pairing thread indefinitely (the read-until-close
+    // loop did). Stop at the chunked terminator / Content-Length.
+    std::string resp;
+    std::array<char, 8192> buf{};
+    const ULONGLONG deadline = GetTickCount64() + 5000;
+    while (GetTickCount64() < deadline) {
+      DWORD avail = 0;
+      if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) break;
+      if (avail == 0) {
+        Sleep(10);
+        continue;
+      }
+      DWORD got = 0;
+      DWORD want = avail < buf.size() ? avail : static_cast<DWORD>(buf.size());
+      if (!ReadFile(h, buf.data(), want, &got, nullptr) || got == 0) break;
+      resp.append(buf.data(), got);
+      if (resp.find("\r\n0\r\n\r\n") != std::string::npos) break;
+      if (auto he = resp.find("\r\n\r\n"); he != std::string::npos) {
+        if (auto cl = resp.find("Content-Length:");
+            cl != std::string::npos && cl < he) {
+          size_t len = std::stoul(resp.substr(cl + 15));
+          if (resp.size() - (he + 4) >= len) break;
+        }
+      }
+    }
+    CloseHandle(h);
+    BOOST_LOG_TRIVIAL(info)
+      << "lumen_tailscale: LocalAPI read " << resp.size() << " bytes";
+
+    auto hdr_end = resp.find("\r\n\r\n");
+    if (hdr_end == std::string::npos) return std::nullopt;
+    std::string headers = resp.substr(0, hdr_end);
+    std::string body = resp.substr(hdr_end + 4);
+    if (headers.find(" 200") == std::string::npos) {
+      BOOST_LOG_TRIVIAL(warning)
+        << "lumen_tailscale: LocalAPI status non-200: "
+        << headers.substr(0, headers.find("\r\n"));
+      return std::nullopt;
+    }
+    std::string lower = headers;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char ch) { return std::tolower(ch); });
+    if (lower.find("transfer-encoding: chunked") != std::string::npos) {
+      body = dechunk(body);
+    }
+    return body;
+  }
 #else
+  static std::optional<std::string> run_cli(const std::string &exec) {
     std::string cmd = "\"" + exec + "\" status --json 2>/dev/null";
     FILE *pipe = popen(cmd.c_str(), "r");
-#endif
     if (!pipe) return std::nullopt;
 
     std::stringstream ss;
@@ -85,11 +199,7 @@ namespace lumen {
     while (auto n = std::fread(buf.data(), 1, buf.size(), pipe)) {
       ss.write(buf.data(), static_cast<std::streamsize>(n));
     }
-#ifdef _WIN32
-    int rc = _pclose(pipe);
-#else
     int rc = pclose(pipe);
-#endif
     if (rc != 0) {
       BOOST_LOG_TRIVIAL(warning)
         << "lumen_tailscale: `" << exec << " status --json` exited " << rc;
@@ -97,6 +207,7 @@ namespace lumen {
     }
     return ss.str();
   }
+#endif
 
   // ─── Refresh + parse ───────────────────────────────────────────────────────
 
