@@ -60,11 +60,6 @@
 
   AVCaptureScreenInput *screenInput = [[AVCaptureScreenInput alloc] initWithDisplayID:self.displayID];
   [screenInput setMinFrameDuration:self.minFrameDuration];
-  // Don't composite the OS cursor into the captured frames. LumeN draws a
-  // client-side cursor (instant, never compressed, never hidden by macOS'
-  // type-to-hide behavior); baking it into the video gave a laggy, flickery
-  // pointer. The two must stay in sync — see in_session_overlay.dart.
-  [screenInput setCapturesCursor:NO];
 
   if ([self.session canAddInput:screenInput]) {
     [self.session addInput:screenInput];
