@@ -37,10 +37,16 @@ namespace lumen {
     policy_t p;
     std::ifstream f(path);
     if (!f.is_open()) {
-      BOOST_LOG_TRIVIAL(info)
+      // No policy file → admit any peer the tailnet identifies.
+      // `nvhttp::pair()` already short-circuits to deny when
+      // `lookup_identity()` returns nullopt, so this can never admit
+      // anonymous traffic — only identified tailnet peers. See ADR 0003.
+      BOOST_LOG_TRIVIAL(warning)
         << "lumen_policy: " << path
-        << " not found; defaulting to deny-all.";
-      return p;  // default-deny
+        << " not found; defaulting to admit-on-tailnet "
+           "(drop a policy.txt with `default=deny` + allowlist to tighten).";
+      p.default_admit = true;
+      return p;
     }
 
     std::string line;
