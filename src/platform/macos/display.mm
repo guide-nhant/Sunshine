@@ -4,6 +4,8 @@
  */
 
 // standard includes
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <sstream>
 #include <thread>
@@ -19,6 +21,7 @@
 #include "src/platform/macos/av_video.h"
 #include "src/platform/macos/misc.h"
 #include "src/platform/macos/nv12_zero_device.h"
+#include "src/platform/macos/sc_video.h"
 
 // Avoid conflict between AVFoundation and libavutil both defining AVMediaType
 #define AVMediaType AVMediaType_FFmpeg
@@ -248,7 +251,13 @@ namespace platf {
     }
 
     capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override {
+      auto last_frame_ticks = std::make_shared<std::atomic<std::chrono::steady_clock::duration::rep>>(
+        std::chrono::steady_clock::now().time_since_epoch().count()
+      );
+
       auto signal = [av_capture capture:^(CMSampleBufferRef sampleBuffer) {
+        last_frame_ticks->store(std::chrono::steady_clock::now().time_since_epoch().count());
+
         auto new_sample_buffer = std::make_shared<av_sample_buf_t>(sampleBuffer);
         auto new_pixel_buffer = std::make_shared<av_pixel_buf_t>(new_sample_buffer->buf);
 
@@ -286,10 +295,26 @@ namespace platf {
         return true;
       }];
 
-      // FIXME: We should time out if an image isn't returned for a while
-      dispatch_semaphore_wait(signal, DISPATCH_TIME_FOREVER);
+      // A wedged AVFoundation session stops delivering sample buffers without
+      // reporting an error; return reinit so the capture loop rebuilds the
+      // display instead of stalling forever.
+      constexpr auto watchdog_timeout = 10s;
+      while (true) {
+        if (dispatch_semaphore_wait(signal, dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC)) == 0) {
+          return capture_e::ok;
+        }
 
-      return capture_e::ok;
+        const auto last_frame = std::chrono::steady_clock::time_point {
+          std::chrono::steady_clock::duration {last_frame_ticks->load()}
+        };
+        if (std::chrono::steady_clock::now() - last_frame > watchdog_timeout) {
+          BOOST_LOG(error) << "macOS capture stalled: no frames delivered for "sv
+                           << std::chrono::duration_cast<std::chrono::seconds>(watchdog_timeout).count()
+                           << "s, reinitializing display"sv;
+          [av_capture.session stopRunning];
+          return capture_e::reinit;
+        }
+      }
     }
 
     std::shared_ptr<img_t> alloc_img() override {
@@ -321,7 +346,14 @@ namespace platf {
         return 1;
       }
 
+      auto cancelled = std::make_shared<std::atomic<bool>>(false);
+
       auto signal = [av_capture capture:^(CMSampleBufferRef sampleBuffer) {
+        if (cancelled->load()) {
+          // Timed out below; img may already be freed — don't touch it.
+          return false;
+        }
+
         auto new_sample_buffer = std::make_shared<av_sample_buf_t>(sampleBuffer);
         auto new_pixel_buffer = std::make_shared<av_pixel_buf_t>(new_sample_buffer->buf);
 
@@ -348,7 +380,11 @@ namespace platf {
         return false;
       }];
 
-      dispatch_semaphore_wait(signal, DISPATCH_TIME_FOREVER);
+      if (dispatch_semaphore_wait(signal, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) != 0) {
+        cancelled->store(true);
+        BOOST_LOG(error) << "macOS capture did not deliver a frame within 5s"sv;
+        return 1;
+      }
 
       return 0;
     }
@@ -369,18 +405,195 @@ namespace platf {
     }
   };
 
+  struct sc_display_t: public display_t {
+    SCVideo *sc_capture {};
+    CGDirectDisplayID display_id {};
+    IOPMAssertionID display_sleep_assertion {kIOPMNullAssertionID};
+
+    ~sc_display_t() override {
+      [sc_capture release];
+
+      if (display_sleep_assertion != kIOPMNullAssertionID) {
+        const auto result = IOPMAssertionRelease(display_sleep_assertion);
+        if (result != kIOReturnSuccess) {
+          BOOST_LOG(warning) << "Unable to release display sleep assertion, IOReturn: "sv << result;
+        }
+      }
+    }
+
+    void prevent_display_sleep() {
+      if (display_sleep_assertion != kIOPMNullAssertionID) {
+        return;
+      }
+
+      const auto result = IOPMAssertionCreateWithName(
+        kIOPMAssertPreventUserIdleDisplaySleep,
+        kIOPMAssertionLevelOn,
+        CFSTR("Sunshine display capture"),
+        &display_sleep_assertion
+      );
+
+      if (result == kIOReturnSuccess) {
+        BOOST_LOG(info) << "Created display sleep prevention assertion, assertion id: "sv << display_sleep_assertion;
+        return;
+      }
+
+      display_sleep_assertion = kIOPMNullAssertionID;
+      BOOST_LOG(warning) << "Unable to create display sleep prevention assertion, IOReturn: "sv << result;
+    }
+
+    capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override {
+      SCVideoStream *capture_stream = [sc_capture capture:^(CMSampleBufferRef sampleBuffer) {
+        auto new_sample_buffer = std::make_shared<av_sample_buf_t>(sampleBuffer);
+        auto new_pixel_buffer = std::make_shared<av_pixel_buf_t>(new_sample_buffer->buf);
+
+        std::shared_ptr<img_t> img_out;
+        if (!pull_free_image_cb(img_out)) {
+          // got interrupt signal
+          // returning false here stops capture backend
+          return false;
+        }
+        auto av_img = std::static_pointer_cast<av_img_t>(img_out);
+
+        auto old_data_retainer = std::make_shared<temp_retain_av_img_t>(
+          av_img->sample_buffer,
+          av_img->pixel_buffer,
+          img_out->data
+        );
+
+        av_img->sample_buffer = new_sample_buffer;
+        av_img->pixel_buffer = new_pixel_buffer;
+        img_out->data = new_pixel_buffer->data();
+
+        img_out->width = (int) CVPixelBufferGetWidth(new_pixel_buffer->buf);
+        img_out->height = (int) CVPixelBufferGetHeight(new_pixel_buffer->buf);
+        img_out->row_pitch = (int) CVPixelBufferGetBytesPerRow(new_pixel_buffer->buf);
+        img_out->pixel_pitch = img_out->row_pitch / img_out->width;
+
+        old_data_retainer = nullptr;
+
+        if (!push_captured_image_cb(std::move(img_out), true)) {
+          // got interrupt signal
+          // returning false here stops capture backend
+          return false;
+        }
+
+        return true;
+      }];
+
+      if (!capture_stream) {
+        return capture_e::error;
+      }
+
+      // No frame-gap watchdog here: SCK is damage-driven, so long gaps are
+      // normal on a static desktop. Stream death is reported through
+      // didStopWithError, which also signals this semaphore.
+      dispatch_semaphore_wait(capture_stream.captureStopped, DISPATCH_TIME_FOREVER);
+
+      const bool stream_error = capture_stream.streamError;
+      [capture_stream release];
+
+      return stream_error ? capture_e::reinit : capture_e::ok;
+    }
+
+    std::shared_ptr<img_t> alloc_img() override {
+      return std::make_shared<av_img_t>();
+    }
+
+    std::unique_ptr<avcodec_encode_device_t> make_avcodec_encode_device(pix_fmt_e pix_fmt) override {
+      if (pix_fmt == pix_fmt_e::yuv420p) {
+        sc_capture.pixelFormat = kCVPixelFormatType_32BGRA;
+
+        return std::make_unique<avcodec_encode_device_t>();
+      } else if (pix_fmt == pix_fmt_e::nv12 || pix_fmt == pix_fmt_e::p010) {
+        auto device = std::make_unique<nv12_zero_device>();
+
+        device->init(static_cast<void *>(sc_capture), pix_fmt, setResolution, setPixelFormat);
+
+        return device;
+      } else {
+        BOOST_LOG(error) << "Unsupported Pixel Format."sv;
+        return nullptr;
+      }
+    }
+
+    int dummy_img(img_t *img) override {
+      if (!platf::is_screen_capture_allowed()) {
+        // A non-zero return value indicates failure to the calling function.
+        return 1;
+      }
+
+      auto cancelled = std::make_shared<std::atomic<bool>>(false);
+
+      SCVideoStream *capture_stream = [sc_capture capture:^(CMSampleBufferRef sampleBuffer) {
+        if (cancelled->load()) {
+          // Timed out below; img may already be freed — don't touch it.
+          return false;
+        }
+
+        auto new_sample_buffer = std::make_shared<av_sample_buf_t>(sampleBuffer);
+        auto new_pixel_buffer = std::make_shared<av_pixel_buf_t>(new_sample_buffer->buf);
+
+        auto av_img = (av_img_t *) img;
+
+        auto old_data_retainer = std::make_shared<temp_retain_av_img_t>(
+          av_img->sample_buffer,
+          av_img->pixel_buffer,
+          img->data
+        );
+
+        av_img->sample_buffer = new_sample_buffer;
+        av_img->pixel_buffer = new_pixel_buffer;
+        img->data = new_pixel_buffer->data();
+
+        img->width = (int) CVPixelBufferGetWidth(new_pixel_buffer->buf);
+        img->height = (int) CVPixelBufferGetHeight(new_pixel_buffer->buf);
+        img->row_pitch = (int) CVPixelBufferGetBytesPerRow(new_pixel_buffer->buf);
+        img->pixel_pitch = img->row_pitch / img->width;
+
+        old_data_retainer = nullptr;
+
+        // returning false here stops capture backend
+        return false;
+      }];
+
+      if (!capture_stream) {
+        return 1;
+      }
+
+      // SCK pushes the initial display content on stream start, so a healthy
+      // stream answers well within this window.
+      if (dispatch_semaphore_wait(capture_stream.captureStopped, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) != 0) {
+        cancelled->store(true);
+        [capture_stream stopWithError:NO];
+        [capture_stream release];
+        BOOST_LOG(error) << "ScreenCaptureKit did not deliver a frame within 5s"sv;
+        return 1;
+      }
+
+      [capture_stream release];
+      return 0;
+    }
+
+    static void setResolution(void *display, int width, int height) {
+      [static_cast<SCVideo *>(display) setFrameWidth:width frameHeight:height];
+    }
+
+    static void setPixelFormat(void *display, OSType pixelFormat) {
+      static_cast<SCVideo *>(display).pixelFormat = pixelFormat;
+    }
+  };
+
   std::shared_ptr<display_t> display(platf::mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
     if (hwdevice_type != platf::mem_type_e::system && hwdevice_type != platf::mem_type_e::videotoolbox) {
       BOOST_LOG(error) << "Could not initialize display with the given hw device type."sv;
       return nullptr;
     }
 
-    auto display = std::make_shared<av_display_t>();
-    display->prevent_display_sleep();
     wake_displays_for_detection(display_name);
 
     // Default to main display
-    display->display_id = CGMainDisplayID();
+    CGDirectDisplayID capture_display_id = CGMainDisplayID();
 
     // Print all displays available with it's name and id
     BOOST_LOG(info) << "Detecting displays"sv;
@@ -395,7 +608,7 @@ namespace platf {
       // We are using CGGetActiveDisplayList that only returns active displays so hardcoded connected value in log to true
       BOOST_LOG(info) << "Detected display: "sv << name.UTF8String << " (id: "sv << [NSString stringWithFormat:@"%@", display_id].UTF8String << ") connected: true"sv;
       if (!display_name.empty() && std::atoi(display_name.c_str()) == [display_id unsignedIntValue]) {
-        display->display_id = [display_id unsignedIntValue];
+        capture_display_id = [display_id unsignedIntValue];
         matched_configured_display = true;
       }
     }
@@ -403,11 +616,42 @@ namespace platf {
     if (!matched_configured_display) {
       BOOST_LOG(warning) << "Configured display ["sv << display_name
                          << "] was not found in the active display list. Falling back to main display ["sv
-                         << display->display_id << "]."sv;
+                         << capture_display_id << "]."sv;
     }
 
-    log_display_diagnostic(display->display_id, "selected for AVFoundation capture");
-    BOOST_LOG(info) << "Configuring selected display ("sv << display->display_id << ") to stream"sv;
+    BOOST_LOG(info) << "Configuring selected display ("sv << capture_display_id << ") to stream"sv;
+
+    // ScreenCaptureKit is the default capture backend (US-062 / ADR 0018);
+    // LUMEN_DISABLE_SCK=1 is the A/B + regression escape hatch back to the
+    // AVFoundation path.
+    if (std::getenv("LUMEN_DISABLE_SCK") == nullptr) {
+      log_display_diagnostic(capture_display_id, "selected for ScreenCaptureKit capture");
+
+      auto sc_display = std::make_shared<sc_display_t>();
+      sc_display->display_id = capture_display_id;
+      sc_display->sc_capture = [[SCVideo alloc] initWithDisplay:capture_display_id frameRate:config.framerate];
+
+      if (sc_display->sc_capture) {
+        sc_display->prevent_display_sleep();
+        sc_display->width = sc_display->sc_capture.frameWidth;
+        sc_display->height = sc_display->sc_capture.frameHeight;
+        // We also need set env_width and env_height for absolute mouse coordinates
+        sc_display->env_width = sc_display->width;
+        sc_display->env_height = sc_display->height;
+
+        return sc_display;
+      }
+
+      BOOST_LOG(warning) << "ScreenCaptureKit setup failed; falling back to AVFoundation capture."sv;
+    } else {
+      BOOST_LOG(info) << "ScreenCaptureKit disabled via LUMEN_DISABLE_SCK; using AVFoundation capture."sv;
+    }
+
+    log_display_diagnostic(capture_display_id, "selected for AVFoundation capture");
+
+    auto display = std::make_shared<av_display_t>();
+    display->prevent_display_sleep();
+    display->display_id = capture_display_id;
 
     display->av_capture = [[AVVideo alloc] initWithDisplay:display->display_id frameRate:config.framerate];
 
