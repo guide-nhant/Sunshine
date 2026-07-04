@@ -180,6 +180,23 @@ namespace platf {
       return false;
     }
 
+    // stream.cpp derives the RTP frame_processing_latency from
+    // img->frame_timestamp; anchor it at the sample's capture time (PTS on
+    // the host clock) rather than callback-arrival time. Windows does the
+    // equivalent with QPC (display_wgc.cpp).
+    std::chrono::steady_clock::time_point sample_buffer_capture_time(CMSampleBufferRef sample_buffer) {
+      auto now = std::chrono::steady_clock::now();
+      const CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample_buffer);
+      if (CMTIME_IS_NUMERIC(pts)) {
+        const CMTime host_now = CMClockGetTime(CMClockGetHostTimeClock());
+        const double age_s = CMTimeGetSeconds(CMTimeSubtract(host_now, pts));
+        if (age_s > 0 && age_s < 1.0) {
+          now -= std::chrono::microseconds(static_cast<int64_t>(age_s * 1e6));
+        }
+      }
+      return now;
+    }
+
     void wake_displays_for_detection(const std::string &display_name) {
       IOPMAssertionID wake_assertion = kIOPMNullAssertionID;
       const auto result = IOPMAssertionDeclareUserActivity(
@@ -283,6 +300,7 @@ namespace platf {
         img_out->height = (int) CVPixelBufferGetHeight(new_pixel_buffer->buf);
         img_out->row_pitch = (int) CVPixelBufferGetBytesPerRow(new_pixel_buffer->buf);
         img_out->pixel_pitch = img_out->row_pitch / img_out->width;
+        img_out->frame_timestamp = sample_buffer_capture_time(sampleBuffer);
 
         old_data_retainer = nullptr;
 
@@ -469,6 +487,7 @@ namespace platf {
         img_out->height = (int) CVPixelBufferGetHeight(new_pixel_buffer->buf);
         img_out->row_pitch = (int) CVPixelBufferGetBytesPerRow(new_pixel_buffer->buf);
         img_out->pixel_pitch = img_out->row_pitch / img_out->width;
+        img_out->frame_timestamp = sample_buffer_capture_time(sampleBuffer);
 
         old_data_retainer = nullptr;
 

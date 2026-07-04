@@ -97,7 +97,10 @@
       (NSString *) AVVideoScalingModeKey: AVVideoScalingModeResizeAspect,
     }];
 
-    dispatch_queue_attr_t qos = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, DISPATCH_QUEUE_PRIORITY_HIGH);
+    // relative_priority must be in [QOS_MIN_RELATIVE_PRIORITY, 0]; the old
+    // DISPATCH_QUEUE_PRIORITY_HIGH (=2) made this attr NULL, silently dropping
+    // the QoS to default.
+    dispatch_queue_attr_t qos = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
     dispatch_queue_t recordingQueue = dispatch_queue_create("videoCaptureQueue", qos);
     [videoOutput setSampleBufferDelegate:self queue:recordingQueue];
 

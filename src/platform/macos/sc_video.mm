@@ -111,7 +111,10 @@ using namespace std::literals;
   self.displayPixelHeight = self.frameHeight;
   CFRelease(mode);
 
-  dispatch_queue_attr_t qos = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, DISPATCH_QUEUE_PRIORITY_HIGH);
+  // relative_priority must be in [QOS_MIN_RELATIVE_PRIORITY, 0]; the old
+  // DISPATCH_QUEUE_PRIORITY_HIGH (=2) made this attr NULL, silently dropping
+  // the QoS to default.
+  dispatch_queue_attr_t qos = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
   dispatch_queue_t queue = dispatch_queue_create("lumenScreenCaptureQueue", qos);
   self.sampleQueue = queue;
   [queue release];
@@ -188,6 +191,10 @@ using namespace std::literals;
   config.pixelFormat = self.pixelFormat;
   config.showsCursor = YES;
   config.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+  // Default queueDepth is 3; the encode pipeline retains CVPixelBuffers by
+  // reference (av_img_t), so a 3-surface pool starves and drops frames at
+  // 60 fps+. 8 is the documented maximum useful depth (WWDC22).
+  config.queueDepth = 8;
 
   if (self.pixelFormat == kCVPixelFormatType_32BGRA) {
     config.colorSpaceName = kCGColorSpaceSRGB;
