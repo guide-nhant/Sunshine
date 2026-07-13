@@ -12,8 +12,10 @@
 #include <display_device/json.h>
 #include <display_device/retry_scheduler.h>
 #include <display_device/settings_manager_interface.h>
+#include <array>
 #include <mutex>
 #include <regex>
+#include <string_view>
 
 // local includes
 #include "audio.h"
@@ -750,6 +752,51 @@ namespace display_device {
     if (!DD_DATA.sm_instance) {
       // Fallback to giving back the output name if the platform is not supported.
       return output_name;
+    }
+
+    // LumeN sentinel (ADR 0024 / US-075 Phase 3): "virtual" resolves to
+    // whichever enumerated display belongs to the VirtualDisplayDriver
+    // (VDD) so the host can capture the virtual monitor without the user
+    // pasting a GDI device id. We match on the friendly name / device id
+    // the driver advertises (via its EDID) because Sunshine has no
+    // INF/driver-provider lookup. If no VDD display is present (driver not
+    // installed or not loaded) we log the available devices and return ""
+    // so the capture layer falls back to the physical primary rather than
+    // failing the stream outright.
+    if (boost::iequals(output_name, "virtual")) {
+      return DD_DATA.sm_instance->execute([](auto &settings_iface) -> std::string {
+        // Substrings the MikeTheTech VDD is expected to advertise.
+        // HARDWARE-PENDING (ADR 0024): confirm the exact string against the
+        // pinned driver and trim this list; the enumerated devices are
+        // logged below so the first on-hardware run is self-diagnosing.
+        static constexpr std::array<std::string_view, 3> vdd_markers {
+          "virtual display", "virtualdisplay", "mttvdd"
+        };
+
+        const auto devices {settings_iface.enumAvailableDevices()};
+        for (const auto &device : devices) {
+          for (const auto marker : vdd_markers) {
+            if (boost::algorithm::icontains(device.m_friendly_name, marker) ||
+                boost::algorithm::icontains(device.m_device_id, marker)) {
+              auto mapped {settings_iface.getDisplayName(device.m_device_id)};
+              BOOST_LOG(info) << "output_name=virtual resolved to VDD device '"
+                              << device.m_friendly_name << "' (" << device.m_device_id
+                              << ") -> display name '" << mapped << "'";
+              return mapped;
+            }
+          }
+        }
+
+        StringSet available;
+        for (const auto &device : devices) {
+          available.insert(device.m_device_id + " - " + device.m_friendly_name);
+        }
+        BOOST_LOG(warning) << "output_name=virtual requested but no VirtualDisplayDriver "
+                              "display was found; falling back to the physical primary. "
+                              "Available devices:\n"
+                           << toJson(available);
+        return {};
+      });
     }
 
     return DD_DATA.sm_instance->execute([&output_name](auto &settings_iface) {
