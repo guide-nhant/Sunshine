@@ -40,6 +40,10 @@ file(GLOB NVPREFS_FILES CONFIGURE_DEPENDS
 # vigem
 include_directories(SYSTEM "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include")
 
+# sudovda — LumeN per-session virtual display (ADR 0025 / US-076).
+# virtual_display.h includes <sudovda/sudovda.h>, so third-party is on the path.
+include_directories(SYSTEM "${CMAKE_SOURCE_DIR}/third-party")
+
 # sunshine icon
 if(NOT DEFINED SUNSHINE_ICON_PATH)
     set(SUNSHINE_ICON_PATH "${CMAKE_SOURCE_DIR}/sunshine.ico")
@@ -73,6 +77,10 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/windows/audio.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/utf_utils.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/utf_utils.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_display.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_display.h"
+        "${CMAKE_SOURCE_DIR}/third-party/sudovda/sudovda.h"
+        "${CMAKE_SOURCE_DIR}/third-party/sudovda/sudovda-ioctl.h"
         "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/src/ViGEmClient.cpp"
         "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include/ViGEm/Client.h"
         "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include/ViGEm/Common.h"
@@ -99,6 +107,9 @@ list(PREPEND PLATFORM_LIBRARIES
         minhook::minhook
         ntdll
         setupapi
+        cfgmgr32
+        dxva2
+        ole32
         shlwapi
         synchronization.lib
         userenv

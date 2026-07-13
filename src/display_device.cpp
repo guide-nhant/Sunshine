@@ -12,10 +12,8 @@
 #include <display_device/json.h>
 #include <display_device/retry_scheduler.h>
 #include <display_device/settings_manager_interface.h>
-#include <array>
 #include <mutex>
 #include <regex>
-#include <string_view>
 
 // local includes
 #include "audio.h"
@@ -27,6 +25,9 @@
   #include <display_device/windows/settings_manager.h>
   #include <display_device/windows/win_api_layer.h>
   #include <display_device/windows/win_display_device.h>
+  #include <objbase.h>  // CoCreateGuid
+  // LumeN: per-session SudoVDA virtual display control (ADR 0025 / US-076).
+  #include "platform/windows/virtual_display.h"
 #endif
 
 namespace display_device {
@@ -41,6 +42,71 @@ namespace display_device {
       std::chrono::milliseconds config_revert_delay {0};
       std::unique_ptr<RetryScheduler<SettingsManagerInterface>> sm_instance {nullptr};
     } DD_DATA;
+
+#ifdef _WIN32
+    /**
+     * @brief LumeN per-session SudoVDA virtual display state (ADR 0025 /
+     *        US-076). Guarded by DD_DATA.mutex. The monitor is created at
+     *        the client's mode on configure_display and removed on
+     *        revert_configuration; map_output_name("virtual") hands the
+     *        capture layer the GDI name stored here.
+     */
+    struct {
+      bool active {false};
+      bool device_open {false};
+      GUID guid {};
+      std::wstring gdi_name;
+    } VDD_STATE;
+
+    /// Create (or replace) the SudoVDA monitor at the session's mode.
+    /// Call with DD_DATA.mutex held.
+    void lumen_create_virtual_display_unlocked(const rtsp_stream::launch_session_t &session) {
+      using namespace VDISPLAY;
+      if (!VDD_STATE.device_open) {
+        if (openVDisplayDevice() != DRIVER_STATUS::OK) {
+          BOOST_LOG(error) << "SudoVDA: openVDisplayDevice failed; virtual display unavailable";
+          return;
+        }
+        VDD_STATE.device_open = true;
+        startPingThread([]() {
+          BOOST_LOG(warning) << "SudoVDA watchdog ping failed";
+        });
+      }
+      if (VDD_STATE.active) {
+        removeVirtualDisplay(VDD_STATE.guid);
+        VDD_STATE.active = false;
+        VDD_STATE.gdi_name.clear();
+      }
+      GUID guid {};
+      if (CoCreateGuid(&guid) != S_OK) {
+        BOOST_LOG(error) << "SudoVDA: CoCreateGuid failed";
+        return;
+      }
+      const uint32_t w {session.width > 0 ? static_cast<uint32_t>(session.width) : 1920u};
+      const uint32_t h {session.height > 0 ? static_cast<uint32_t>(session.height) : 1080u};
+      const uint32_t fps {session.fps > 0 ? static_cast<uint32_t>(session.fps) : 60u};
+      auto name {createVirtualDisplay("LumeN", "LumeN", w, h, fps, guid)};
+      if (name.empty()) {
+        BOOST_LOG(error) << "SudoVDA: createVirtualDisplay failed for " << w << "x" << h << "@" << fps;
+        return;
+      }
+      VDD_STATE.guid = guid;
+      VDD_STATE.gdi_name = std::move(name);
+      VDD_STATE.active = true;
+      BOOST_LOG(info) << "SudoVDA virtual display created " << w << "x" << h << "@" << fps;
+    }
+
+    /// Remove the active SudoVDA monitor. Call with DD_DATA.mutex held.
+    void lumen_remove_virtual_display_unlocked() {
+      using namespace VDISPLAY;
+      if (VDD_STATE.active) {
+        removeVirtualDisplay(VDD_STATE.guid);
+        VDD_STATE.active = false;
+        VDD_STATE.gdi_name.clear();
+        BOOST_LOG(info) << "SudoVDA virtual display removed";
+      }
+    }
+#endif
 
     /**
      * @brief Helper class for capturing audio context when the API demands it.
@@ -754,49 +820,22 @@ namespace display_device {
       return output_name;
     }
 
-    // LumeN sentinel (ADR 0024 / US-075 Phase 3): "virtual" resolves to
-    // whichever enumerated display belongs to the VirtualDisplayDriver
-    // (VDD) so the host can capture the virtual monitor without the user
-    // pasting a GDI device id. We match on the friendly name / device id
-    // the driver advertises (via its EDID) because Sunshine has no
-    // INF/driver-provider lookup. If no VDD display is present (driver not
-    // installed or not loaded) we log the available devices and return ""
-    // so the capture layer falls back to the physical primary rather than
-    // failing the stream outright.
+    // LumeN sentinel (ADR 0025 / US-076): "virtual" means "capture the
+    // per-session SudoVDA monitor". The monitor itself is created in
+    // configure_display() (which has the client's requested mode); here we
+    // just hand back its GDI \\.\DISPLAYx name so the capture layer targets
+    // it. If no virtual display is active we log + return "" so capture
+    // falls back to the physical primary rather than failing the stream.
     if (boost::iequals(output_name, "virtual")) {
-      return DD_DATA.sm_instance->execute([](auto &settings_iface) -> std::string {
-        // Substrings the MikeTheTech VDD is expected to advertise.
-        // HARDWARE-PENDING (ADR 0024): confirm the exact string against the
-        // pinned driver and trim this list; the enumerated devices are
-        // logged below so the first on-hardware run is self-diagnosing.
-        static constexpr std::array<std::string_view, 3> vdd_markers {
-          "virtual display", "virtualdisplay", "mttvdd"
-        };
-
-        const auto devices {settings_iface.enumAvailableDevices()};
-        for (const auto &device : devices) {
-          for (const auto marker : vdd_markers) {
-            if (boost::algorithm::icontains(device.m_friendly_name, marker) ||
-                boost::algorithm::icontains(device.m_device_id, marker)) {
-              auto mapped {settings_iface.getDisplayName(device.m_device_id)};
-              BOOST_LOG(info) << "output_name=virtual resolved to VDD device '"
-                              << device.m_friendly_name << "' (" << device.m_device_id
-                              << ") -> display name '" << mapped << "'";
-              return mapped;
-            }
-          }
-        }
-
-        StringSet available;
-        for (const auto &device : devices) {
-          available.insert(device.m_device_id + " - " + device.m_friendly_name);
-        }
-        BOOST_LOG(warning) << "output_name=virtual requested but no VirtualDisplayDriver "
-                              "display was found; falling back to the physical primary. "
-                              "Available devices:\n"
-                           << toJson(available);
-        return {};
-      });
+#ifdef _WIN32
+      if (VDD_STATE.active && !VDD_STATE.gdi_name.empty()) {
+        // GDI device names are ASCII, so the narrowing is safe.
+        return std::string(VDD_STATE.gdi_name.begin(), VDD_STATE.gdi_name.end());
+      }
+      BOOST_LOG(warning) << "output_name=virtual but no SudoVDA display is active; "
+                            "falling back to the physical primary.";
+#endif
+      return {};
     }
 
     return DD_DATA.sm_instance->execute([&output_name](auto &settings_iface) {
@@ -805,6 +844,17 @@ namespace display_device {
   }
 
   void configure_display(const config::video_t &video_config, const rtsp_stream::launch_session_t &session) {
+#ifdef _WIN32
+    // LumeN (ADR 0025 / US-076): output_name=="virtual" spins up a SudoVDA
+    // monitor at the client's exact mode for this session. No physical
+    // libdisplaydevice reconfig is needed in that case — the virtual
+    // monitor is already at the requested resolution/refresh.
+    if (boost::iequals(video_config.output_name, "virtual")) {
+      std::lock_guard lock {DD_DATA.mutex};
+      lumen_create_virtual_display_unlocked(session);
+      return;
+    }
+#endif
     const auto result {parse_configuration(video_config, session)};
     if (const auto *parsed_config {std::get_if<SingleDisplayConfiguration>(&result)}; parsed_config) {
       configure_display(*parsed_config);
@@ -839,6 +889,10 @@ namespace display_device {
 
   void revert_configuration() {
     std::lock_guard lock {DD_DATA.mutex};
+#ifdef _WIN32
+    // Tear down the per-session SudoVDA monitor (no-op if none active).
+    lumen_remove_virtual_display_unlocked();
+#endif
     revert_configuration_unlocked(revert_option_e::try_indefinitely_with_delay);
   }
 
