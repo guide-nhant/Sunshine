@@ -149,6 +149,12 @@ include_directories(
         ${Boost_INCLUDE_DIRS}  # has to be the last, or we get runtime error on macOS ffmpeg encoder
 )
 
+# Re-prepend after the block above so nvenc_base.cpp picks nv-codec-headers's
+# ffnvcodec/nvEncodeAPI.h (pinned at NVENCAPI 13.0) instead of the version
+# bundled inside the fetched ffmpeg tarball on Windows CI, where the two
+# disagree and trip the compatibility guard.
+include_directories(BEFORE SYSTEM "${CMAKE_SOURCE_DIR}/third-party/nv-codec-headers/include")
+
 list(APPEND SUNSHINE_EXTERNAL_LIBRARIES
         ${MINIUPNP_LIBRARIES}
         ${CMAKE_THREAD_LIBS_INIT}
