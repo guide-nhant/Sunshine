@@ -99,6 +99,16 @@ namespace display_device {
   void revert_configuration();
 
   /**
+   * @brief LumeN (ADR 0025 / US-076): remove the per-session SudoVDA virtual
+   *        display, independent of the physical display-config revert.
+   *
+   * Called unconditionally on session end so the virtual monitor never
+   * outlives the stream (the whole point of the per-session model — no idle
+   * lag). Idempotent + no-op when no virtual display is active or off Windows.
+   */
+  void revert_virtual_display();
+
+  /**
    * @brief Reset the persistence and currently held initial display state.
    *
    * This is normally used to get out of the "broken" state where the algorithm wants

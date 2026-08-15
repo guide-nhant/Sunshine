@@ -12,6 +12,9 @@
 #include <display_device/json.h>
 #include <display_device/retry_scheduler.h>
 #include <display_device/settings_manager_interface.h>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <mutex>
 #include <regex>
 
@@ -26,6 +29,8 @@
   #include <display_device/windows/win_api_layer.h>
   #include <display_device/windows/win_display_device.h>
   #include <objbase.h>  // CoCreateGuid
+  #include <dxgi.h>  // adapter enumeration for the render-GPU pick
+  #include <wrl/client.h>
   // LumeN: per-session SudoVDA virtual display control (ADR 0025 / US-076).
   #include "platform/windows/virtual_display.h"
 #endif
@@ -58,13 +63,72 @@ namespace display_device {
       std::wstring gdi_name;
     } VDD_STATE;
 
+    /// Append a line to a crash-surviving SudoVDA log (sunshine.log is
+    /// truncated on each host restart, so a host crash loses the evidence).
+    /// `%USERPROFILE%\AppData\Local\LumeN\host\sudovda-lumen.log`.
+    void lumen_vdd_log(const std::string &line) {
+      BOOST_LOG(info) << "SudoVDA: " << line;
+      if (const char *profile = std::getenv("USERPROFILE")) {
+        try {
+          std::ofstream f {std::string(profile) + "\\AppData\\Local\\LumeN\\host\\sudovda-lumen.log",
+                           std::ios::app};
+          f << line << '\n';
+        } catch (...) {
+        }
+      }
+    }
+
+    /// Pick the GPU SudoVDA should render the virtual display on. Order:
+    ///   1. the encoder adapter the user configured (`config::video.adapter_name`),
+    ///   2. the adapter that actually drives an output (matches the GPU the
+    ///      QSV/NVENC encoder captures from — critical on hybrid laptops, or
+    ///      capture reads a display rendered on the wrong GPU and crashes),
+    ///   3. the first hardware adapter.
+    std::wstring lumen_pick_render_adapter() {
+      std::wstring configured;
+      {
+        const auto &an = config::video.adapter_name;
+        configured.assign(an.begin(), an.end());  // ASCII widen
+      }
+      Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+      if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        return configured;
+      }
+      Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+      std::wstring configured_match, with_output, first_hw;
+      for (UINT i = 0; SUCCEEDED(factory->EnumAdapters(i, adapter.ReleaseAndGetAddressOf())); ++i) {
+        DXGI_ADAPTER_DESC desc {};
+        if (FAILED(adapter->GetDesc(&desc))) {
+          continue;
+        }
+        std::wstring name {desc.Description};
+        if (name.find(L"Basic") != std::wstring::npos) {
+          continue;  // skip Microsoft Basic Render Driver
+        }
+        if (!configured.empty() && name == configured) {
+          configured_match = name;
+        }
+        if (first_hw.empty()) {
+          first_hw = name;
+        }
+        Microsoft::WRL::ComPtr<IDXGIOutput> output;
+        if (with_output.empty() && SUCCEEDED(adapter->EnumOutputs(0, output.GetAddressOf()))) {
+          with_output = name;  // this GPU drives a physical display
+        }
+      }
+      if (!configured_match.empty()) {
+        return configured_match;
+      }
+      return !with_output.empty() ? with_output : first_hw;
+    }
+
     /// Create (or replace) the SudoVDA monitor at the session's mode.
     /// Call with DD_DATA.mutex held.
     void lumen_create_virtual_display_unlocked(const rtsp_stream::launch_session_t &session) {
       using namespace VDISPLAY;
       if (!VDD_STATE.device_open) {
         if (openVDisplayDevice() != DRIVER_STATUS::OK) {
-          BOOST_LOG(error) << "SudoVDA: openVDisplayDevice failed; virtual display unavailable";
+          lumen_vdd_log("openVDisplayDevice failed; virtual display unavailable");
           return;
         }
         VDD_STATE.device_open = true;
@@ -72,6 +136,20 @@ namespace display_device {
           BOOST_LOG(warning) << "SudoVDA watchdog ping failed";
         });
       }
+
+      // Set the render GPU before adding the display. Must match the GPU the
+      // encoder captures from (hybrid laptops: capturing a display rendered
+      // on the other GPU crashes the host), so pick the output-driving GPU.
+      const auto render_adapter {lumen_pick_render_adapter()};
+      if (!render_adapter.empty()) {
+        const bool ok {setRenderAdapterByName(render_adapter)};
+        lumen_vdd_log("render adapter '" +
+                      std::string(render_adapter.begin(), render_adapter.end()) +
+                      "' set=" + (ok ? "true" : "false"));
+      } else {
+        lumen_vdd_log("no render adapter found to set");
+      }
+
       if (VDD_STATE.active) {
         removeVirtualDisplay(VDD_STATE.guid);
         VDD_STATE.active = false;
@@ -79,31 +157,51 @@ namespace display_device {
       }
       GUID guid {};
       if (CoCreateGuid(&guid) != S_OK) {
-        BOOST_LOG(error) << "SudoVDA: CoCreateGuid failed";
+        lumen_vdd_log("CoCreateGuid failed");
         return;
       }
       const uint32_t w {session.width > 0 ? static_cast<uint32_t>(session.width) : 1920u};
       const uint32_t h {session.height > 0 ? static_cast<uint32_t>(session.height) : 1080u};
       const uint32_t fps {session.fps > 0 ? static_cast<uint32_t>(session.fps) : 60u};
-      auto name {createVirtualDisplay("LumeN", "LumeN", w, h, fps, guid)};
+      // SudoVDA's RefreshRate field is in **milli-Hz**, not Hz (Apollo passes
+      // fps * 1000). Passing Hz here yields an invalid mode and AddVirtualDisplay
+      // fails.
+      const uint32_t refresh_mhz {fps * 1000u};
+      // Unique EDID serial per session so a re-create never collides with a
+      // lingering monitor (ERROR_ALREADY_EXISTS / 183). Fits SudoVDA's 13-char
+      // SerialNumber field.
+      char serial[14];
+      std::snprintf(serial, sizeof(serial), "LN%08lX%03X",
+                    static_cast<unsigned long>(guid.Data1),
+                    static_cast<unsigned>(guid.Data2 & 0xFFF));
+      const std::string mode {std::to_string(w) + "x" + std::to_string(h) + "@" + std::to_string(fps)};
+      lumen_vdd_log("createVirtualDisplay begin " + mode + " serial=" + serial);
+      // Track for removal BEFORE the call: the monitor can be created even if
+      // we fail to read its name back (Apollo tracks it regardless), so it must
+      // be torn down on session end no matter what.
+      VDD_STATE.guid = guid;
+      VDD_STATE.active = true;
+      VDD_STATE.gdi_name.clear();
+      auto name {createVirtualDisplay(serial, "LumeN", w, h, refresh_mhz, guid)};
       if (name.empty()) {
-        BOOST_LOG(error) << "SudoVDA: createVirtualDisplay failed for " << w << "x" << h << "@" << fps;
+        lumen_vdd_log("createVirtualDisplay returned empty " + mode +
+                      " (GetLastError=" + std::to_string(GetLastError()) +
+                      "); tracked for removal, capture falls back to primary");
         return;
       }
-      VDD_STATE.guid = guid;
       VDD_STATE.gdi_name = std::move(name);
-      VDD_STATE.active = true;
-      BOOST_LOG(info) << "SudoVDA virtual display created " << w << "x" << h << "@" << fps;
+      lumen_vdd_log("virtual display created " + mode + " -> " +
+                    std::string(VDD_STATE.gdi_name.begin(), VDD_STATE.gdi_name.end()));
     }
 
     /// Remove the active SudoVDA monitor. Call with DD_DATA.mutex held.
     void lumen_remove_virtual_display_unlocked() {
       using namespace VDISPLAY;
       if (VDD_STATE.active) {
-        removeVirtualDisplay(VDD_STATE.guid);
+        const bool ok {removeVirtualDisplay(VDD_STATE.guid)};
         VDD_STATE.active = false;
         VDD_STATE.gdi_name.clear();
-        BOOST_LOG(info) << "SudoVDA virtual display removed";
+        lumen_vdd_log(std::string("virtual display removed ok=") + (ok ? "true" : "false"));
       }
     }
 #endif
@@ -894,6 +992,16 @@ namespace display_device {
     lumen_remove_virtual_display_unlocked();
 #endif
     revert_configuration_unlocked(revert_option_e::try_indefinitely_with_delay);
+  }
+
+  void revert_virtual_display() {
+#ifdef _WIN32
+    // Independent of the physical-config revert gate in stream.cpp — the
+    // virtual monitor must always be dropped when the stream ends, else it
+    // leaks and lags the host at idle (ADR 0025 / US-076).
+    std::lock_guard lock {DD_DATA.mutex};
+    lumen_remove_virtual_display_unlocked();
+#endif
   }
 
   bool reset_persistence() {

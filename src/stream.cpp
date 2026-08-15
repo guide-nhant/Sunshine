@@ -1959,6 +1959,12 @@ namespace stream {
           display_device::revert_configuration();
         }
 
+        // LumeN (ADR 0025 / US-076): the per-session SudoVDA virtual display
+        // must be torn down on EVERY session end, regardless of the
+        // physical-config revert gate above (which is skipped while an app
+        // is running). Idempotent no-op when no virtual display is active.
+        display_device::revert_virtual_display();
+
         platf::streaming_will_stop();
       }
 
